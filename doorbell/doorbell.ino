@@ -12,27 +12,39 @@
 // Audio files should be unsigned 8-bit PCM .wav files with sample rate = 32000 samples/s
 //
 // Command protocol
-// Byte 0: the MSB of number of bytes in command
-// Byte 1: the LSB of number of bytes in command
-// Byte 2: is command number
+// Byte 0: 1-byte message checksum
+// Bytes [1:3]: the number of bytes in the packet, including the checksum. Byte 4 is the MSB
+// Bytes [3:11]: 8-byte authentication token. Byte 10 is the MSB
+// Byte 11: is the command number
 //
-// Command 1: Print bytes [3:] to serial monitor
+// Command 1: Print bytes [12:] to serial monitor
 //
 // Command 2: Ring
-//    Byte 3: file id to play
+//    Byte 12: file id to play
 //
 // Command 3: Create file
-//    Byte 3: file id
-//    Bytes [4:]: file contents
+//    Byte 12: file id
+//    Bytes [13:]: file contents
 //
 // Command 4: Append to file
-//    Byte 3: file id
-//    Bytes [4:]: file contents
+//    Byte 12: file id
+//    Bytes [13:]: file contents
 //
 // Command 5: Delete file
-//    Byte 3: file id
+//    Byte 12: file id. If the file id is 0xFF, delete all files
 //
 // Command 6: Format filesystem
+//
+// Command 7: Add authentication token  // TODO
+// 
+// Command 8: Remove authentication token // TODO
+//
+//
+//
+// CHECKSUM:
+//    The checksum is a 8-bit sum complement checksum of the
+//    entire packet including metadata
+//    (https://en.wikipedia.org/wiki/Checksum#Sum_complement)
 //
 
 
@@ -127,89 +139,108 @@ void loop() {
 
 void check_for_commands() {
 
-  static const int BUFF_SIZE = 4095;
-  static char command_buff[BUFF_SIZE];
+  static const int BUFF_SIZE = 4096;
+  static char packet[BUFF_SIZE];
+
+  static const int RESP_SIZE = 1024;
+  static char response[RESP_SIZE];
 
   WiFiClient remoteClient = server.available();
-  command_buff[0] = 0;  // Reset null terminator
   
   if (remoteClient) {
     Serial.println("Got client");
 
-    int buff_ptr = 0;
-    memset(command_buff, 0, BUFF_SIZE);
+    int read_len = 0;
+    memset(packet, 0, BUFF_SIZE);
 
-    char str[40];
-    while (remoteClient.available() && buff_ptr < (BUFF_SIZE - 1)) {    
+    while (remoteClient.available() && read_len < (BUFF_SIZE - 1)) {    
       char read_byte = remoteClient.read();      
-      command_buff[buff_ptr] = read_byte;
-      buff_ptr++;
-    }
-
-    // Verify all bytes were received
-    int num_expected = (command_buff[0] << 8) + command_buff[1];
-    if(buff_ptr != num_expected) {
-      Serial.print("Error: buffer length incorrect. Expected ");
-      Serial.print(num_expected);
-      Serial.print(" but length was ");
-      Serial.println(buff_ptr);
-      return;
+      packet[read_len] = read_byte;
+      read_len++;
     }
     
-    Serial.printf("Command: [%d, %d, %d]: %d bytes\n", command_buff[0], command_buff[1], command_buff[2], buff_ptr);
+    memset(response, 0, RESP_SIZE);
 
-    // Delegate command handling
-    int cmd = command_buff[2];
-    switch(cmd) {
-      case 1: {
-        Serial.print("Print command: ");
-        Serial.println((command_buff + 3));
-        break;
-      }
-        
-      case 2: {
-        Serial.println("Ring command...");
-        char filename[FILENAME_SIZE];
-        sprintf(filename, "/%d.wav", command_buff[3]);
-        play_audio(filename);
-        break;
-      }
-        
-      case 3: {
-        char filename[FILENAME_SIZE];
-        sprintf(filename, "/%d.wav", command_buff[3]);
-        writeFile(SPIFFS, filename, &command_buff[4]); 
-        break;
-      }
+    // Response based on packet success
+    switch(validate_packet(packet, read_len)) {
+      case 0:
+        execute_command(packet, read_len);
+        sprintf(response, "ACK\r\n");
+        break;  // Packet is valid
 
-      case 4: {
-        char filename[FILENAME_SIZE];
-        sprintf(filename, "/%d.wav", command_buff[3]);
-        appendFile(SPIFFS, filename, &command_buff[4]);
+      case 1:
+        sprintf(response, "Packet length did not match expected");
         break;
-      }
 
-      case 5: {
-        char filename[FILENAME_SIZE];
-        sprintf(filename, "/%d.wav", command_buff[3]);
-        deleteFile(SPIFFS, filename);
+      case 2:
+        sprintf(response, "Invalid checksum");
         break;
-      }
 
-      case 6: {
-        formatFS(SPIFFS);
-        break;
-      }
-        
-      default:
-        Serial.printf("Unrecognized command: %d", cmd);
+      case 3:
+        sprintf(response, "Invalid authentication token");
         break;
     }
 
-    remoteClient.print("ack");
+    remoteClient.print(response);
     remoteClient.stop();
     Serial.println("Disconnected from client");
   }  
+}
+
+
+void execute_command(char* packet, int len) {
+
+  Serial.printf("Executing command: [%d, %d]: %d bytes\n", packet[11], packet[12], len);
+
+  packet[len] = 0;  // Append the null terminator for commands that expect the packet to end in a string. Kinda hacky but whatever
+
+  // Delegate command handling
+  int cmd = packet[11];
+  switch(cmd) {
+    case 1: {
+      Serial.print("Print command: ");
+      Serial.println((packet + 12));
+      break;
+    }
+      
+    case 2: {
+      char filename[FILENAME_SIZE];
+      sprintf(filename, "/%d.wav", packet[12]);
+      play_audio(filename);
+      break;
+    }
+      
+    case 3: {
+      char filename[FILENAME_SIZE];
+      sprintf(filename, "/%d.wav", packet[12]);
+      writeFile(SPIFFS, filename, &packet[13]); 
+      break;
+    }
+
+    case 4: {
+      char filename[FILENAME_SIZE];
+      sprintf(filename, "/%d.wav", packet[12]);
+      appendFile(SPIFFS, filename, &packet[13]);
+      break;
+    }
+
+    case 5: {
+      // TODO: 0xFF deletes all files
+      char filename[FILENAME_SIZE];
+      sprintf(filename, "/%d.wav", packet[12]);
+      deleteFile(SPIFFS, filename);
+      break;
+    }
+
+    case 6: {
+      formatFS(SPIFFS);
+      break;
+    }
+      
+    default:
+      Serial.printf("Unrecognized command: %d", cmd);
+      break;
+  }
 }
 
 
